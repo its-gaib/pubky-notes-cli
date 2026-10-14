@@ -5,17 +5,9 @@ import { CliError } from './errors.js'
 import { normalizeFolder } from './folders.js'
 export { normalizeFolder, folderContains } from './folders.js'
 import { editNote, ensureCrdt, initializeNote, validateCrdtNote } from './crdt.js'
+import type { CrdtNote } from './crdt.js'
 
-export interface Note {
-  id: string
-  title: string
-  content: string
-  createdAt: string
-  updatedAt: string
-  folder?: string
-  deleted?: boolean
-  crdt?: { version: 1; update: string; lineage: string }
-}
+export interface Note extends CrdtNote {}
 
 export interface NoteView {
   note: Note
