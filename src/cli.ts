@@ -6,8 +6,8 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import QRCode from 'qrcode'
 import { login, logout, status, withSession } from './auth.js'
-import { createNote, deleteNote, folderContains, getNote, listNotes, MAX_NOTE_BYTES } from './notes.js'
-import { normalizeFolder, publishNote, unpublishNote, updateNote } from './notes.js'
+import { createNote, deleteNote, folderContains, getNote, listNotes } from './notes.js'
+import { normalizeFolder, publishNote, restoreNote, unpublishNote, updateNote } from './notes.js'
 import type { NoteView } from './notes.js'
 import { CliError } from './errors.js'
 
@@ -16,7 +16,7 @@ const HELP = `Pubky Notes CLI
   pubky-notes login [--force] [--qr-file PATH]
   pubky-notes status
   pubky-notes logout
-  pubky-notes list [--folder PATH] [--visibility all|private|public]
+  pubky-notes list [--folder PATH] [--visibility all|private|public] [--trash]
   pubky-notes get ID [--markdown]
   pubky-notes search QUERY
   pubky-notes create [--title TITLE] [--file FILE|--stdin] [--folder PATH]
@@ -25,6 +25,7 @@ const HELP = `Pubky Notes CLI
   pubky-notes publish ID --if-revision HASH
   pubky-notes unpublish ID --if-revision HASH
   pubky-notes delete ID --if-revision HASH
+  pubky-notes restore ID --if-revision HASH
 
 Output is JSON unless --markdown is requested. New notes are private.
 Get a note first and pass its revision when modifying an existing note.
@@ -39,11 +40,11 @@ const inputs = { file: textOption, stdin: boolOption }
 const revisionOption = { 'if-revision': textOption }
 const specs: Record<string, Record<string, Option>> = {
   login: { force: boolOption, 'qr-file': textOption }, status: {}, logout: {},
-  list: { folder: textOption, visibility: textOption }, get: { markdown: boolOption }, search: {},
+  list: { folder: textOption, visibility: textOption, trash: boolOption }, get: { markdown: boolOption }, search: {},
   create: { title: textOption, folder: textOption, ...inputs },
   update: { title: textOption, ...inputs, ...revisionOption },
   move: { folder: textOption, ...revisionOption },
-  publish: revisionOption, unpublish: revisionOption, delete: revisionOption,
+  publish: revisionOption, unpublish: revisionOption, delete: revisionOption, restore: revisionOption,
 }
 
 export function json(value: unknown): string {
@@ -51,8 +52,13 @@ export function json(value: unknown): string {
 }
 
 export function summary(view: NoteView) {
-  const { content: _content, ...note } = view.note
+  const { content: _content, crdt: _crdt, ...note } = view.note
   return { ...note, published: !!view.published, revision: view.revision }
+}
+
+export function readableView(view: NoteView) {
+  const { crdt: _crdt, ...note } = view.note
+  return { ...view, note }
 }
 
 export async function readContent(file: string | undefined, stdin: boolean): Promise<string | undefined> {
@@ -65,7 +71,7 @@ export async function readContent(file: string | undefined, stdin: boolean): Pro
     for await (const chunk of stream) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       size += bytes.length
-      if (size > MAX_NOTE_BYTES) throw new CliError('LIMIT_EXCEEDED', 'Markdown input exceeds 512 KiB.')
+      if (size > 512 * 1024) throw new CliError('LIMIT_EXCEEDED', 'Markdown input exceeds 512 KiB.')
       chunks.push(bytes)
     }
     return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
@@ -101,13 +107,13 @@ export async function run(args: string[]): Promise<void> {
   if (values.help) { process.stdout.write(HELP); return }
   const string = (key: string) => typeof values[key] === 'string' ? values[key] as string : undefined
   const flag = (key: string) => values[key] === true
-  const needsId = ['get', 'update', 'move', 'publish', 'unpublish', 'delete'].includes(command)
+  const needsId = ['get', 'update', 'move', 'publish', 'unpublish', 'delete', 'restore'].includes(command)
   const count = needsId || command === 'search' ? 1 : 0
   if (positionals.length !== count) throw new CliError('USAGE', `This command expects ${count} positional argument${count === 1 ? '' : 's'}. Run pubky-notes --help.`)
   const id = positionals[0]
   if (needsId && !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new CliError('INVALID_ID', 'Use a note ID returned by list or search.')
   const revision = string('if-revision')
-  if (['update', 'move', 'publish', 'unpublish', 'delete'].includes(command) && !/^[a-f0-9]{64}$/.test(revision ?? '')) {
+  if (['update', 'move', 'publish', 'unpublish', 'delete', 'restore'].includes(command) && !/^[a-f0-9]{64}$/.test(revision ?? '')) {
     throw new CliError('INVALID_REVISION', 'Read the note with get, then supply its revision with --if-revision.')
   }
   if (command === 'move' && string('folder') === undefined) throw new CliError('USAGE', 'Move requires --folder; use an empty value for Unfiled.')
@@ -133,7 +139,7 @@ export async function run(args: string[]): Promise<void> {
   else if (command === 'logout') { await logout(); result = { authenticated: false } }
   else result = await withSession(async session => {
     if (command === 'list' || command === 'search') {
-      let notes = await listNotes(session)
+      let notes = await listNotes(session, { trash: command === 'list' && flag('trash') })
       if (command === 'search') {
         const terms = id.trim().toLowerCase().split(/\s+/)
         notes = notes.filter(({ note }) => terms.every(term => `${note.title}\n${note.content}`.toLowerCase().includes(term)))
@@ -146,9 +152,11 @@ export async function run(args: string[]): Promise<void> {
     if (command === 'move') return updateNote(session, id, revision!, { folder })
     if (command === 'publish') return publishNote(session, id, revision!)
     if (command === 'unpublish') return unpublishNote(session, id, revision!)
+    if (command === 'restore') return restoreNote(session, id, revision!)
     await deleteNote(session, id, revision!)
-    return { deleted: id }
+    return { deleted: id, recoverable: true }
   })
+  if (['get', 'create', 'update', 'move', 'publish', 'unpublish', 'restore'].includes(command)) result = readableView(result as NoteView)
   if (command === 'get' && flag('markdown')) {
     const note = (result as NoteView).note
     let markdown = `# ${note.title}\n\n${note.content}`

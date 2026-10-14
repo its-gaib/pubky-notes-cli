@@ -33,12 +33,13 @@ The CLI uses its own grant, separate from the web app. A `flock` process lock se
 
 ## Notes
 
-Commands return JSON on stdout. Errors use JSON on stderr and a nonzero exit code. Login instructions and the terminal QR go to stderr. `get --markdown` returns Markdown instead of JSON.
+Commands return JSON on stdout. Opaque CRDT history stays internal and is omitted from normal output; revisions still cover it. Errors use JSON on stderr and a nonzero exit code. Login instructions and the terminal QR go to stderr. `get --markdown` returns Markdown instead of JSON.
 
-`list` and `search` return arrays of note summaries with a `revision`. `get`, `create`, `update`, `move`, `publish`, and `unpublish` return `{ "note": ..., "published": ..., "revision": ... }`; `published` is either the public snapshot or `null`. Errors have the shape `{ "error": { "code": "...", "message": "..." } }`. `status` reports `authenticated`, and when logged in, `owner` and `grantExpiresAt`.
+`list` and `search` return arrays of note summaries with a `revision`. `get`, `create`, `update`, `move`, `publish`, `unpublish`, and `restore` return `{ "note": ..., "published": ..., "revision": ... }`; `published` is either the public snapshot or `null`. Errors have the shape `{ "error": { "code": "...", "message": "..." } }`. `status` reports `authenticated`, and when logged in, `owner` and `grantExpiresAt`.
 
 ```sh
 pubky-notes list
+pubky-notes list --trash
 pubky-notes list --folder 'Work/Project' --visibility private
 pubky-notes search 'meeting decisions'
 pubky-notes get NOTE_ID
@@ -60,13 +61,15 @@ pubky-notes move NOTE_ID --folder '' --if-revision REVISION
 pubky-notes publish NOTE_ID --if-revision REVISION
 pubky-notes unpublish NOTE_ID --if-revision REVISION
 pubky-notes delete NOTE_ID --if-revision REVISION
+pubky-notes get NOTE_ID
+pubky-notes restore NOTE_ID --if-revision REVISION
 ```
 
-Read the note again after a successful mutation to obtain its current revision. On a conflict, inspect the latest content and reapply the intended change; do not blindly retry with a new revision. A browser with an older unsaved draft can still autosave after a CLI write, so finish or close that editor before editing the same note through the CLI.
+Read the note again after a successful mutation to obtain its current revision. On a conflict, inspect the latest content and reapply the intended change; do not blindly retry with a new revision. The browser and CLI store compatible Yjs CRDT updates. Edits apply to the previously read text, so synchronizing a stale browser draft preserves concurrent CLI edits. Overlapping text changes can still produce a combined result that needs human editing; CRDT convergence does not infer the intended wording.
 
-Publishing explicitly copies the current draft to a public snapshot. Later private edits do not update that snapshot until you publish again. Unpublish removes the public snapshot; delete removes both the private draft and its public snapshot.
+Publishing explicitly copies the current draft to a public snapshot. Later private edits do not update that snapshot until you publish again. Unpublish removes the public snapshot. Delete removes the public snapshot and marks the private note as deleted, retaining its text and CRDT history. `list --trash` lists deleted notes; `get` reads them by ID, and `restore` makes one visible again without republishing. Update and publish require restoration first. Deletion is recoverable, not secure erasure; public copies already downloaded may remain elsewhere.
 
-Files stay flat at `/priv/notes/<id>.json` and `/pub/notes/<id>.json`. Nested folder paths are private metadata, excluded from public snapshots. Search covers all titles and note bodies. Private notes use homeserver access control; the homeserver operator can read them.
+Files stay flat at `/priv/notes/<id>.json` and `/pub/notes/<id>.json`. Nested folder paths and CRDT history are private metadata, excluded from public snapshots. The web app also keeps empty-folder metadata at `/priv/notes/folders`, which the CLI ignores when listing notes. CRDT history retains earlier private text in the note file; there is no automatic history compaction or permanent purge command. Each stored note may use up to 4 MiB including history, with up to 250,000 Markdown characters. File/stdin input remains limited to 512 KiB. Saves fail rather than silently dropping history. Search covers all titles and note bodies. Private notes use homeserver access control; the homeserver operator can read them.
 
 ## Agent integration
 

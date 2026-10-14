@@ -4,7 +4,7 @@ import type { Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
 import {
   createNote, deleteNote, folderContains, getNote, listNotes, MAX_CONTENT_LENGTH, MAX_NOTE_BYTES,
-  normalizeFolder, publishNote, SAMPLE_MARKDOWN, unpublishNote, updateNote,
+  normalizeFolder, publishNote, restoreNote, SAMPLE_MARKDOWN, unpublishNote, updateNote,
 } from './notes.js'
 import type { Note } from './notes.js'
 
@@ -186,13 +186,16 @@ test('second lock acquisition failure releases the first lock', async () => {
   assert.equal(events.filter((event) => event.startsWith('free ')).length, 1)
 })
 
-test('publishing writes private first and strips private folder metadata', async () => {
+test('publishing writes private first and strips folder metadata and private CRDT history', async () => {
   const { session, files, events } = makeSession([[privatePath(), { ...fixture(), folder: 'Secret/Plans' }]])
   const before = await getNote(session, 'note-1')
   const published = await publishNote(session, 'note-1', before.revision)
   assert.equal(published.note.folder, 'Secret/Plans')
   assert.equal(published.published!.folder, undefined)
   assert.equal((files.get(publicPath()) as Note).folder, undefined)
+  assert.equal((files.get(publicPath()) as Note).crdt, undefined)
+  assert.equal((files.get(publicPath()) as Note).deleted, undefined)
+  assert.ok(published.note.crdt)
   assert.deepEqual(events.filter((event) => event.startsWith('put ')), [`put ${privatePath()}`, `put ${publicPath()}`])
   assert.deepEqual(await getNote(session, 'note-1'), published)
 })
@@ -209,7 +212,8 @@ test('private-save failure prevents publishing; public-save failure preserves th
     await put(lock, body)
   }
   await assert.rejects(publishNote(session, 'note-1', before.revision))
-  assert.deepEqual(files.get(privatePath()), fixture())
+  assert.equal((files.get(privatePath()) as Note).content, fixture().content)
+  assert.ok((files.get(privatePath()) as Note).crdt)
   assert.equal(files.has(publicPath()), false)
 })
 
@@ -220,7 +224,8 @@ test('unpublishing an orphan first preserves a private original', async () => {
   assert.equal(before.published!.folder, undefined)
   const after = await unpublishNote(session, 'note-1', before.revision)
   assert.equal(after.published, null)
-  assert.deepEqual(files.get(privatePath()), fixture())
+  assert.equal((files.get(privatePath()) as Note).content, fixture().content)
+  assert.ok((files.get(privatePath()) as Note).crdt)
   assert.equal(files.has(publicPath()), false)
   assert.deepEqual(events.filter((event) => /^(put|delete) /.test(event)), [`put ${privatePath()}`, `delete ${publicPath()}`])
   assert.deepEqual(await getNote(session, 'note-1'), after)
@@ -235,7 +240,7 @@ test('orphan private-save failure preserves its public file', async () => {
   assert.equal(events.some((event) => event.startsWith('delete ')), false)
 })
 
-test('deletion removes public first and keeps private when public removal fails', async () => {
+test('deletion removes public first and keeps a recoverable private tombstone', async () => {
   const { session, files, storage, events } = makeSession([[privatePath(), fixture()], [publicPath(), fixture()]])
   const before = await getNote(session, 'note-1')
   const remove = storage.deleteLocked
@@ -244,18 +249,16 @@ test('deletion removes public first and keeps private when public removal fails'
   assert.equal(files.size, 2)
   storage.deleteLocked = remove
   await deleteNote(session, 'note-1', before.revision)
-  assert.equal(files.size, 0)
-  assert.deepEqual(events.filter((event) => event.startsWith('delete ')), [`delete ${publicPath()}`, `delete ${privatePath()}`])
+  assert.equal(files.size, 1)
+  assert.equal((files.get(privatePath()) as Note).deleted, true)
+  assert.equal((files.get(privatePath()) as Note).content, fixture().content)
+  assert.deepEqual(events.filter((event) => event.startsWith('delete ')), [`delete ${publicPath()}`])
 })
 
-test('private deletion failure reports failure after safe public removal', async () => {
+test('private tombstone-save failure reports failure after safe public removal', async () => {
   const { session, files, storage } = makeSession([[privatePath(), fixture()], [publicPath(), fixture()]])
   const before = await getNote(session, 'note-1')
-  const remove = storage.deleteLocked
-  storage.deleteLocked = async (lock) => {
-    if (lock.path.startsWith('/priv/')) throw httpError(500)
-    return remove(lock)
-  }
+  storage.putTextLocked = async () => { throw httpError(500) }
   await assert.rejects(deleteNote(session, 'note-1', before.revision))
   assert.equal(files.has(privatePath()), true)
   assert.equal(files.has(publicPath()), false)
@@ -274,7 +277,8 @@ test('validates IDs, size, timestamps, matching embedded IDs and private folders
   assert.equal(events.length, 0)
   await assert.rejects(createNote(session, { title: 'x'.repeat(201) }), hasCode('INVALID_NOTE'))
   await assert.rejects(createNote(session, { content: 'x'.repeat(MAX_CONTENT_LENGTH + 1) }), hasCode('INVALID_NOTE'))
-  await assert.rejects(createNote(session, { content: '漢'.repeat(200_000) }), hasCode('LIMIT_EXCEEDED'))
+  const unicodeNote = await createNote(session, { content: '漢'.repeat(200_000) })
+  assert.equal(unicodeNote.note.content.length, 200_000)
   for (const invalid of [{ ...fixture(), id: 'other' }, { ...fixture(), updatedAt: 'yesterday' }, { ...fixture(), folder: 2 }]) {
     files.set(privatePath(), invalid)
     await assert.rejects(getNote(session, 'note-1'), (error) => error instanceof CliError)
@@ -350,4 +354,84 @@ test('listing bounds total entries and does not hide non-missing directory error
   await assert.rejects(listNotes(session))
   storage.list = async () => { throw httpError(404) }
   assert.deepEqual(await listNotes(session), [])
+})
+
+
+test('trash listing and restore preserve content and never republish', async () => {
+  const { session, files } = makeSession([[privatePath(), fixture()], [publicPath(), fixture()]])
+  const before = await getNote(session, 'note-1')
+  await deleteNote(session, 'note-1', before.revision)
+  assert.deepEqual(await listNotes(session), [])
+  const trash = await listNotes(session, { trash: true })
+  assert.equal(trash.length, 1)
+  assert.equal(trash[0].note.content, fixture().content)
+  assert.equal(trash[0].note.deleted, true)
+  await assert.rejects(updateNote(session, 'note-1', trash[0].revision, { title: 'Changed' }), hasCode('NOTE_DELETED'))
+  await assert.rejects(publishNote(session, 'note-1', trash[0].revision), hasCode('NOTE_DELETED'))
+  const restored = await restoreNote(session, 'note-1', trash[0].revision)
+  assert.equal(restored.note.deleted, undefined)
+  assert.equal(restored.note.content, fixture().content)
+  assert.equal(restored.published, null)
+  assert.equal(files.has(publicPath()), false)
+  assert.equal((await listNotes(session)).length, 1)
+  assert.deepEqual(await listNotes(session, { trash: true }), [])
+})
+
+test('readback failures never claim a successful note save', async () => {
+  const { session, storage } = makeSession([[privatePath(), fixture()]])
+  const before = await getNote(session, 'note-1')
+  storage.putTextLocked = async () => undefined
+  await assert.rejects(updateNote(session, 'note-1', before.revision, { content: 'Unacknowledged edit' }), hasCode('WRITE_NOT_CONFIRMED'))
+})
+
+test('web fixture and CLI edits share identical histories and merge in either order', async () => {
+  const { ensureCrdt, mergeNotes } = await import('./crdt.js')
+  const { webFixture } = await import('./crdt-web-fixture.js')
+  assert.deepEqual(await ensureCrdt(webFixture.legacy), webFixture.base)
+  const { session, files } = makeSession([[privatePath(webFixture.base.id), webFixture.base]])
+  const before = await getNote(session, webFixture.base.id)
+  const edited = await updateNote(session, webFixture.base.id, before.revision, { content: 'First line\nLast line from CLI', folder: 'Projects' })
+  assert.equal(edited.note.crdt!.lineage, webFixture.base.crdt.lineage)
+  const merged = mergeNotes(edited.note, webFixture.browser)
+  assert.equal(merged.content, 'First line from browser\nLast line from CLI')
+  assert.equal(merged.folder, 'Projects')
+  assert.deepEqual(mergeNotes(webFixture.browser, edited.note), merged)
+  files.set(privatePath(webFixture.base.id), merged)
+  const after = await getNote(session, webFixture.base.id)
+  assert.deepEqual(after.note, merged)
+  await assert.rejects(updateNote(session, webFixture.base.id, edited.revision, { title: 'Stale' }), hasCode('REVISION_CONFLICT'))
+})
+
+test('a concurrent browser edit survives a CLI tombstone and explicit restore', async () => {
+  const { mergeNotes } = await import('./crdt.js')
+  const { webFixture } = await import('./crdt-web-fixture.js')
+  const { session, files } = makeSession([[privatePath(webFixture.base.id), webFixture.base]])
+  const before = await getNote(session, webFixture.base.id)
+  await deleteNote(session, webFixture.base.id, before.revision)
+  const tombstone = await getNote(session, webFixture.base.id)
+  const merged = mergeNotes(tombstone.note, webFixture.browser)
+  assert.equal(merged.deleted, true)
+  assert.equal(merged.content, webFixture.browser.content)
+  files.set(privatePath(webFixture.base.id), merged)
+  const deleted = await getNote(session, webFixture.base.id)
+  const restored = await restoreNote(session, webFixture.base.id, deleted.revision)
+  assert.equal(restored.note.deleted, undefined)
+  assert.equal(restored.note.content, webFixture.browser.content)
+  assert.equal(restored.note.crdt!.lineage, webFixture.base.crdt.lineage)
+})
+
+test('rejects tampered snapshots and malformed CRDT envelopes without writing', async () => {
+  const { webFixture } = await import('./crdt-web-fixture.js')
+  const { session, files, events } = makeSession()
+  for (const invalid of [
+    { ...webFixture.base, content: 'Changed without CRDT operations' },
+    { ...webFixture.base, crdt: { ...webFixture.base.crdt, version: 2 } },
+    { ...webFixture.base, crdt: { ...webFixture.base.crdt, update: 'AAAA' } },
+    { ...webFixture.base, crdt: null },
+    { ...webFixture.base, deleted: 'true' },
+  ]) {
+    files.set(privatePath(webFixture.base.id), invalid)
+    await assert.rejects(getNote(session, webFixture.base.id), hasCode('INVALID_NOTE'))
+  }
+  assert.equal(events.some(event => event.startsWith('put ')), false)
 })

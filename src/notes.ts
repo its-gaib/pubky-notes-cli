@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { PubkyResource } from '@synonymdev/pubky'
 import type { Path, Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
+import { normalizeFolder } from './folders.js'
+export { normalizeFolder, folderContains } from './folders.js'
+import { editNote, ensureCrdt, initializeNote, validateCrdtNote } from './crdt.js'
 
 export interface Note {
   id: string
@@ -10,6 +13,8 @@ export interface Note {
   createdAt: string
   updatedAt: string
   folder?: string
+  deleted?: boolean
+  crdt?: { version: 1; update: string; lineage: string }
 }
 
 export interface NoteView {
@@ -20,7 +25,7 @@ export interface NoteView {
 
 export type NotePatch = { title?: string; content?: string; folder?: string }
 
-export const MAX_NOTE_BYTES = 512 * 1024
+export const MAX_NOTE_BYTES = 4 * 1024 * 1024
 export const MAX_CONTENT_LENGTH = 250_000
 export const SAMPLE_MARKDOWN = [
   '## Heading',
@@ -42,31 +47,7 @@ type Space = keyof typeof ROOTS
 type Pair = { private: Note | null; public: Note | null }
 type Locks = Record<Space, StorageLock>
 
-export function normalizeFolder(input: string): string {
-  if (typeof input !== 'string' || /[\\\u0000-\u001f\u007f-\u009f]/u.test(input)) {
-    throw new CliError('INVALID_FOLDER', 'Folder names cannot contain backslashes or control characters.')
-  }
-  const trimmed = input.trim().replace(/^\/+|\/+$/g, '')
-  if (!trimmed) return ''
-  const segments = trimmed.split('/').map((segment) => segment.trim())
-  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
-    throw new CliError('INVALID_FOLDER', 'Folder names cannot be empty, ".", or "..". Separate names with a single slash.')
-  }
-  const path = segments.join('/')
-  if (path.length > 512 || segments.length > 8 || segments.some((segment) => segment.length > 80)) {
-    throw new CliError('INVALID_FOLDER', 'Folder paths allow 8 levels, 80 characters per name, and 512 characters total.')
-  }
-  return path
-}
-
-export function folderContains(parent: string, path: string): boolean {
-  const normalizedParent = normalizeFolder(parent)
-  const normalizedPath = normalizeFolder(path)
-  return normalizedPath === normalizedParent ||
-    (normalizedParent !== '' && normalizedPath.startsWith(`${normalizedParent}/`))
-}
-
-export async function listNotes(session: Session): Promise<NoteView[]> {
+export async function listNotes(session: Session, options: { trash?: boolean } = {}): Promise<NoteView[]> {
   const [privateIds, publicIds] = await Promise.all([
     listIds(session, 'private'), listIds(session, 'public'),
   ])
@@ -81,7 +62,7 @@ export async function listNotes(session: Session): Promise<NoteView[]> {
       results[position] = pair.private || pair.public ? toView(pair) : null
     }
   }))
-  return results.filter((note): note is NoteView => note !== null)
+  return results.filter((note): note is NoteView => note !== null && !!note.note.deleted === !!options.trash)
     .sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt) || a.note.id.localeCompare(b.note.id))
 }
 
@@ -91,15 +72,14 @@ export async function getNote(session: Session, id: string): Promise<NoteView> {
 
 export async function createNote(session: Session, input: NotePatch = {}): Promise<NoteView> {
   const now = new Date().toISOString()
-  const note = validateNote({
+  const note = validateNote(initializeNote(validateNote({
     id: randomUUID(), title: input.title ?? 'Untitled note', content: input.content ?? SAMPLE_MARKDOWN,
     createdAt: now, updatedAt: now, folder: input.folder,
-  })
+  })))
   return withLocks(session, note.id, async (locks) => {
     const existing = await readPair(session, note.id)
     if (existing.private || existing.public) throw new CliError('NOTE_COLLISION', 'A note already occupies this ID. Retry creating the note.')
-    await renew(session, locks)
-    await session.storage.putTextLocked(locks.private, JSON.stringify(note))
+    await writeVerifiedNote(session, locks, 'private', note)
     return toView({ private: note, public: null })
   })
 }
@@ -107,40 +87,35 @@ export async function createNote(session: Session, input: NotePatch = {}): Promi
 export async function updateNote(session: Session, id: string, revision: string, patch: NotePatch): Promise<NoteView> {
   return mutate(session, id, revision, async (pair, locks) => {
     const original = canonical(pair)
-    const updated = validateNote({
-      ...original,
+    if (original.deleted) throw new CliError('NOTE_DELETED', 'Restore this note before editing it.')
+    const updated = validateNote(editNote(await ensureCrdt(original), {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.content !== undefined ? { content: patch.content } : {}),
-      ...(patch.folder !== undefined ? { folder: patch.folder } : {}),
+      ...(patch.folder !== undefined ? { folder: normalizeFolder(patch.folder) } : {}),
       updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString(),
-    }, id)
-    await renew(session, locks)
-    await session.storage.putTextLocked(locks.private, JSON.stringify(updated))
+    }), id)
+    await writeVerifiedNote(session, locks, 'private', updated)
     return toView({ private: updated, public: pair.public })
   })
 }
 
 export async function publishNote(session: Session, id: string, revision: string): Promise<NoteView> {
   return mutate(session, id, revision, async (pair, locks) => {
-    const note = canonical(pair)
+    const original = canonical(pair)
+    if (original.deleted) throw new CliError('NOTE_DELETED', 'Restore this note before publishing it.')
+    const note = validateNote(await ensureCrdt(original))
     const snapshot = publicSnapshot(note)
-    // Persist the private original before exposing a public snapshot.
-    await renew(session, locks)
-    await session.storage.putTextLocked(locks.private, JSON.stringify(note))
-    await renew(session, locks)
-    await session.storage.putTextLocked(locks.public, JSON.stringify(snapshot))
+    // Persist and verify the private original before exposing a public snapshot.
+    await writeVerifiedNote(session, locks, 'private', note)
+    await writeVerifiedNote(session, locks, 'public', snapshot)
     return toView({ private: note, public: snapshot })
   })
 }
 
 export async function unpublishNote(session: Session, id: string, revision: string): Promise<NoteView> {
   return mutate(session, id, revision, async (pair, locks) => {
-    const note = canonical(pair)
-    if (!pair.private) {
-      // An orphaned public snapshot must survive privately before it is removed.
-      await renew(session, locks)
-      await session.storage.putTextLocked(locks.private, JSON.stringify(note))
-    }
+    const note = pair.private ?? validateNote(await ensureCrdt(canonical(pair)))
+    if (!pair.private) await writeVerifiedNote(session, locks, 'private', note)
     if (pair.public) {
       await renew(session, locks)
       await deleteLockedIfPresent(session, locks.public)
@@ -151,16 +126,36 @@ export async function unpublishNote(session: Session, id: string, revision: stri
 
 export async function deleteNote(session: Session, id: string, revision: string): Promise<void> {
   await mutate(session, id, revision, async (pair, locks) => {
-    // Never delete the private original while a public removal has failed.
+    const note = validateNote(await ensureCrdt(canonical(pair)))
+    // Preserve an orphan privately before its only public copy is removed.
+    if (!pair.private) await writeVerifiedNote(session, locks, 'private', note)
     if (pair.public) {
       await renew(session, locks)
       await deleteLockedIfPresent(session, locks.public)
     }
-    if (pair.private) {
-      await renew(session, locks)
-      await deleteLockedIfPresent(session, locks.private)
-    }
+    const deleted = validateNote(editNote(note, { deleted: true, updatedAt: new Date(Math.max(Date.now(), Date.parse(note.updatedAt) + 1)).toISOString() }))
+    await writeVerifiedNote(session, locks, 'private', deleted)
   })
+}
+
+export async function restoreNote(session: Session, id: string, revision: string): Promise<NoteView> {
+  return mutate(session, id, revision, async (pair, locks) => {
+    const original = canonical(pair)
+    if (!original.deleted) throw new CliError('NOTE_NOT_DELETED', 'This note is already active.')
+    const restored = validateNote(editNote(await ensureCrdt(original), { deleted: false, updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString() }))
+    await writeVerifiedNote(session, locks, 'private', restored)
+    return toView({ private: restored, public: pair.public })
+  })
+}
+
+async function writeVerifiedNote(session: Session, locks: Locks, space: Space, note: Note): Promise<void> {
+  const validated = validateNote(note)
+  await renew(session, locks)
+  await session.storage.putTextLocked(locks[space], JSON.stringify(validated))
+  const actual = await readOptional(session, notePath(space, note.id), note.id)
+  if (!actual || JSON.stringify(actual) !== JSON.stringify(validated)) {
+    throw new CliError('WRITE_NOT_CONFIRMED', 'The homeserver did not confirm the saved note. Read it again before retrying.')
+  }
 }
 
 async function mutate<T>(session: Session, id: string, revision: string, action: (pair: Pair, locks: Locks) => Promise<T>): Promise<T> {
@@ -252,8 +247,7 @@ function revisionOf(pair: Pair): string {
 }
 
 function publicSnapshot(note: Note): Note {
-  const { folder: _folder, ...snapshot } = note
-  return snapshot
+  return { id: note.id, title: note.title, content: note.content, createdAt: note.createdAt, updatedAt: note.updatedAt }
 }
 
 async function deleteLockedIfPresent(session: Session, lock: StorageLock): Promise<void> {
@@ -346,6 +340,15 @@ function validateNote(value: unknown, expectedId?: string): Note {
     if (typeof record.folder !== 'string') throw new CliError('INVALID_FOLDER', 'Invalid note folder.')
     const folder = normalizeFolder(record.folder)
     if (folder) note.folder = folder
+  }
+  if (record.deleted !== undefined) {
+    if (typeof record.deleted !== 'boolean') throw new CliError('INVALID_NOTE', 'Invalid deleted state.')
+    if (record.deleted) note.deleted = true
+  }
+  if (record.crdt !== undefined) {
+    if (typeof record.crdt !== 'object' || record.crdt === null) throw new CliError('INVALID_NOTE', 'Invalid CRDT editing history.')
+    note.crdt = record.crdt as Note['crdt']
+    try { note.crdt = validateCrdtNote(note).crdt } catch { throw new CliError('INVALID_NOTE', 'Invalid or inconsistent CRDT note data.') }
   }
   if (Buffer.byteLength(JSON.stringify(note), 'utf8') > MAX_NOTE_BYTES) {
     throw new CliError('LIMIT_EXCEEDED', 'This note is too large to save.')

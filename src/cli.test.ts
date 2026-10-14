@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { json, readContent, run, summary } from './cli.js'
+import { json, readContent, readableView, run, summary } from './cli.js'
 import { CliError } from './errors.js'
 
 test('rejects ambiguous input and unsafe mutations before opening a session', async () => {
   for (const args of [
     ['update', 'id', '--title', 'Changed'],
+    ['restore', 'id'],
     ['delete', '../escape', '--if-revision', 'a'.repeat(64)],
     ['move', 'id', '--if-revision', 'a'.repeat(64)],
     ['list', '--visibility', 'everything'],
@@ -41,10 +42,21 @@ test('JSON output neutralizes terminal controls without altering parsed content'
 })
 
 test('list summaries omit note bodies and public snapshots', () => {
-  const note = { id: 'id', title: 'Title', content: 'private body', createdAt: '2026-10-14T00:00:00Z', updatedAt: '2026-10-14T00:00:00Z', folder: 'Work' }
+  const note = { id: 'id', title: 'Title', content: 'private body', createdAt: '2026-10-14T00:00:00Z', updatedAt: '2026-10-14T00:00:00Z', folder: 'Work', crdt: { version: 1 as const, update: 'private history', lineage: 'test' } }
   const output = summary({ note, published: { ...note, content: 'public body' }, revision: 'a'.repeat(64) })
   assert.equal(output.published, true)
   assert.equal('content' in output, false)
   assert.equal(output.folder, 'Work')
+  assert.equal('crdt' in output, false)
   assert.equal(json(output).includes('body'), false)
+})
+
+
+test('readable note output hides opaque history while preserving text and revision', () => {
+  const note = { id: 'id', title: 'Title', content: 'Visible text', createdAt: '2026-10-14T00:00:00Z', updatedAt: '2026-10-14T00:00:00Z', crdt: { version: 1 as const, update: 'large private history', lineage: 'test' } }
+  const result = readableView({ note, published: null, revision: 'b'.repeat(64) })
+  assert.equal(result.note.content, 'Visible text')
+  assert.equal(result.revision, 'b'.repeat(64))
+  assert.equal('crdt' in result.note, false)
+  assert.ok(note.crdt)
 })
