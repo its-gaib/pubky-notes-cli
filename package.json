@@ -1,0 +1,16 @@
+{
+  "name": "pubky-notes-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Command-line access to Pubky Notes with persistent Pubky Ring login",
+  "bin": { "pubky-notes": "dist/cli.js" },
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": { "@synonymdev/pubky": "0.16.1", "qrcode": "1.5.4" },
+  "devDependencies": { "@types/node": "^22.0.0", "@types/qrcode": "1.5.6", "typescript": "~7.0.2" }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Pubky Notes"
+  short_description: "Read and write your Pubky Markdown notes"
+  default_prompt: "Use $pubky-notes to save these notes to my Pubky account."
+policy:
+  allow_implicit_invocation: true
