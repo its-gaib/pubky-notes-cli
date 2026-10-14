@@ -26,6 +26,7 @@ function session(grantId = 'old-grant', overrides: { capabilities?: string[]; si
     async exportLocalSecret() { return `${grantId}-secret` },
     get grant() { return {
       free() {},
+      async grantId() { return grantId },
       async sessionInfo() { return {
         capabilities: overrides.capabilities ?? ['/priv/notes/:rw', '/pub/notes/:rw'],
         clientId: overrides.clientId ?? 'pubky-notes-cli', grantExpiresAt: expires, grantId,
@@ -188,5 +189,21 @@ test('logout preserves credentials when server revocation fails and removes them
     await auth.logout()
     assert.equal(active.revoked(), 1)
     assert.equal(await state.read(), null)
+  } finally { await cleanup() }
+})
+
+
+test('canceling a force login never revokes the existing saved grant if Ring reused it', async () => {
+  const candidate = session('old-grant')
+  const approval = deferred<Session>()
+  const { auth, state, cleanup } = await fixture({ async startGrantAuthFlow() { return flow(approval.promise) } })
+  try {
+    await assert.rejects(auth.login({ force: true, onQr: async () => {
+      approval.resolve(candidate.value)
+      await new Promise((resolve) => setImmediate(resolve))
+      throw new Error('renderer failed')
+    } }), /renderer failed/)
+    assert.equal(candidate.revoked(), 0)
+    assert.deepEqual(await state.read(), stored)
   } finally { await cleanup() }
 })

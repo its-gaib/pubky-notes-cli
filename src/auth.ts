@@ -90,6 +90,20 @@ export class AuthManager {
     return this.withSession(async (session) => (await this.describe(session)).summary)
   }
 
+  private async discardCandidate(session: Session, saved: StoredSession | null): Promise<void> {
+    // Reauthorizing may return the existing grant. Revoking that candidate on
+    // cancellation would also destroy the saved session we promised to retain.
+    if (saved) {
+      const grant = session.grant
+      if (!grant) return
+      try {
+        if (await grant.grantId() === saved.grantId) return
+      } catch { return }
+      finally { grant.free() }
+    }
+    await session.signout().catch(() => undefined)
+  }
+
   async login(options: LoginOptions): Promise<SessionSummary> {
     return this.state.withLock(async () => {
       if (options.signal?.aborted) throw canceled()
@@ -125,7 +139,7 @@ export class AuthManager {
       const approval = (async () => {
         const approved = await flow.awaitApproval()
         if (wasCanceled) {
-          await approved.signout().catch(() => undefined)
+          await this.discardCandidate(approved, saved)
           approved.free()
           throw canceled()
         }
@@ -152,7 +166,7 @@ export class AuthManager {
         return details.summary
       } catch (error) {
         wasCanceled = true
-        if (candidate && !committed) await candidate.signout().catch(() => undefined)
+        if (candidate && !committed) await this.discardCandidate(candidate, saved)
         throw error
       } finally {
         options.signal?.removeEventListener('abort', abort)
@@ -179,8 +193,9 @@ export class AuthManager {
   }
 }
 
-const auth = new AuthManager()
-export const withSession = <T>(work: (session: Session) => Promise<T>): Promise<T> => auth.withSession(work)
-export const login = (options: LoginOptions): Promise<SessionSummary> => auth.login(options)
-export const status = (): Promise<SessionSummary> => auth.status()
-export const logout = (): Promise<void> => auth.logout()
+let auth: AuthManager | undefined
+const manager = () => auth ??= new AuthManager()
+export const withSession = <T>(work: (session: Session) => Promise<T>): Promise<T> => manager().withSession(work)
+export const login = (options: LoginOptions): Promise<SessionSummary> => manager().login(options)
+export const status = (): Promise<SessionSummary> => manager().status()
+export const logout = (): Promise<void> => manager().logout()

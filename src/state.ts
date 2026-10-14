@@ -3,7 +3,7 @@ import { open, mkdir, lstat, realpath, chmod, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join, parse, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { CliError } from './errors.js'
 
@@ -32,10 +32,23 @@ export class SessionState {
   private get credentials(): string { return join(this.directory, 'session.json') }
 
   private async ensureDirectory(): Promise<void> {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 })
-    const stat = await lstat(this.directory)
-    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || await realpath(this.directory) !== resolve(this.directory)) throw stateError()
-    await chmod(this.directory, 0o700)
+    const target = resolve(this.directory)
+    const filesystemRoot = parse(target).root
+    let current = filesystemRoot
+    // An attacker-owned or writable ancestor could replace the credential
+    // directory even when the credential directory itself is private.
+    for (const part of target.slice(filesystemRoot.length).split(sep).filter(Boolean)) {
+      current = join(current, part)
+      try { await mkdir(current, { mode: 0o700 }) }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+      const stat = await lstat(current)
+      const owner = process.getuid?.()
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.uid !== owner && stat.uid !== 0) ||
+          ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0)) throw stateError()
+      if (current === target && stat.uid !== owner) throw stateError()
+    }
+    if (await realpath(target) !== target) throw stateError()
+    await chmod(target, 0o700)
   }
 
   private async checkFile(file: FileHandle, privateMode = true): Promise<void> {

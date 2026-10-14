@@ -107,3 +107,13 @@ test('lock waiting supports cancellation without taking over another process loc
     await assert.rejects(waiting, { code: 'LOGIN_CANCELLED' })
   } finally { release(); await holding; await cleanup() }
 })
+
+
+test('writable non-sticky ancestors are rejected before credentials are created', async () => {
+  const { root, state, cleanup } = await fixture()
+  try {
+    await chmod(root, 0o777)
+    await assert.rejects(state.withLock(() => state.write(saved)), { code: 'UNSAFE_STATE' })
+    await assert.rejects(stat(join(state.directory, 'session.json')), { code: 'ENOENT' })
+  } finally { await chmod(root, 0o700); await cleanup() }
+})
