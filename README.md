@@ -66,7 +66,7 @@ Read the note again after a successful mutation to obtain its current revision. 
 
 Publishing explicitly copies the current draft to a public snapshot. Later private edits do not update that snapshot until you publish again. Unpublish removes the public snapshot; delete removes both the private draft and its public snapshot.
 
-Files stay flat at `/priv/notes/<id>.json` and `/pub/notes/<id>.json`. Nested folder paths are private metadata, excluded from public snapshots. Search covers all titles and note bodies. Private notes use homeserver access control; the homeserver operator can read them. If your notes still use the former `/notes.pubky.app/notes/` paths, open the web app and complete its migration first: this CLI only reads the current namespace.
+Files stay flat at `/priv/notes/<id>.json` and `/pub/notes/<id>.json`. Nested folder paths are private metadata, excluded from public snapshots. Search covers all titles and note bodies. Private notes use homeserver access control; the homeserver operator can read them.
 
 ## Agent integration
 
