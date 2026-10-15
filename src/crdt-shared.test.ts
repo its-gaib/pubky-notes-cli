@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as Y from 'yjs'
-import { editNote, materializeSharedNote, mergeNotes, newPersonalDocument, noteRevision, validateCrdtNote } from './crdt.js'
+import { checkpointNote, decode, editNote, listNoteVersions, materializeSharedNote, mergeNotes, newPersonalDocument, noteRevision, readNoteVersion, validateCrdtNote, validateSharedUpdate } from './crdt.js'
 
 function shared() {
   const doc = new Y.Doc({ gc: false }), personal = newPersonalDocument('Work')
@@ -34,4 +34,23 @@ test('CLI merges shared content and same-account personal updates from serialize
   assert.equal(merged.folder, 'Browser')
   assert.equal(merged.deleted, true)
   assert.throws(() => validateCrdtNote({ ...merged, content: 'Forged' }), /does not match/)
+})
+
+test('shared note checkpoints stay private and leave peer-visible updates unchanged', () => {
+  const initial = checkpointNote(shared(), { recordedAt: '2026-10-14T00:00:00Z' })
+  const edited = editNote(initial, { title: 'Changed in terminal', content: 'Last', updatedAt: '2026-10-14T00:01:00Z' })
+  const saved = checkpointNote(edited, { recordedAt: edited.updatedAt })
+  assert.equal(saved.crdt!.update, edited.crdt!.update)
+  assert.notEqual(noteRevision(saved), noteRevision(edited))
+  const versions = listNoteVersions(saved)
+  assert.equal(versions.length, 2)
+  assert.deepEqual(readNoteVersion(saved, versions[0].id), { title: 'Shared note', content: 'First\nLast' })
+  assert.deepEqual(readNoteVersion(saved, versions[1].id), { title: 'Changed in terminal', content: 'Last' })
+  assert.deepEqual(validateCrdtNote(JSON.parse(JSON.stringify(saved))), saved)
+  validateSharedUpdate(decode(saved.crdt!.update))
+  const peer = new Y.Doc({ gc: false })
+  try {
+    Y.applyUpdate(peer, decode(saved.crdt!.update))
+    assert.deepEqual([...peer.share.keys()].sort(), ['content', 'title'])
+  } finally { peer.destroy() }
 })

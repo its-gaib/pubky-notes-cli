@@ -5,6 +5,11 @@ import { normalizeFolder } from './folders.js'
 export const MAX_NOTE_BYTES = 4 * 1024 * 1024
 export const MAX_CONTENT_LENGTH = 250_000
 export const MAX_TITLE_LENGTH = 200
+export const MAX_NOTE_VERSIONS = 5_000
+export const MAX_VERSION_SNAPSHOT_BYTES = 128 * 1024
+
+export interface NoteVersionInfo { id: string; recordedAt: string; restoredFrom?: string }
+interface NoteVersionEntry { recordedAt: string; snapshot: string; restoredFrom?: string }
 
 export type NoteHistory =
   | { version: 1; update: string; lineage: string }
@@ -122,6 +127,53 @@ export function noteRevision(note: CrdtNote): string {
   return note.crdt ? `${note.crdt.lineage}:${note.crdt.update}${note.crdt.version === 2 ? `:${note.crdt.personal}` : ''}` : JSON.stringify(note)
 }
 
+/** Save a compact checkpoint in the owner's private document, never in peer-visible state. */
+export function checkpointNote(note: CrdtNote, options: { recordedAt?: string; restoredFrom?: string } = {}): CrdtNote {
+  const current = validateCrdtNote(note)
+  if (!current.crdt) throw new Error('Initialize this note before saving a version.')
+  const recordedAt = options.recordedAt ?? new Date().toISOString()
+  if (!timestamp(recordedAt)) throw new Error('Invalid note version date.')
+  const doc = current.crdt.version === 2 ? sharedDocumentOf(current) : documentOf(current)
+  const personal = current.crdt.version === 2 ? personalDocumentOf(current) : doc
+  try {
+    const history = personal.getMap<NoteVersionEntry>('history')
+    if (options.restoredFrom !== undefined && !history.has(options.restoredFrom)) throw new Error('The restored note version no longer exists.')
+    const latest = versionEntries(history).at(-1)
+    if (latest) {
+      const previous = snapshotText(doc, history.get(latest.id)!.snapshot)
+      if (previous.title === current.title && previous.content === current.content) return current
+    }
+    const orderedAt = latest && Date.parse(recordedAt) <= Date.parse(latest.recordedAt)
+      ? new Date(Date.parse(latest.recordedAt) + 1).toISOString() : recordedAt
+    addCheckpoint(doc, personal, orderedAt, history.size === 0 && current.crdt.version === 1 ? 'initial' : crypto.randomUUID(), options.restoredFrom)
+    return current.crdt.version === 2
+      ? materializeSharedNote(doc, personal, current, current.crdt.lineage)
+      : materialize(doc, current, current.crdt.lineage)
+  } finally { doc.destroy(); if (personal !== doc) personal.destroy() }
+}
+
+/** The timeline is private and ordered by the time each browser saved a version. */
+export function listNoteVersions(note: CrdtNote): NoteVersionInfo[] {
+  const current = validateCrdtNote(note)
+  if (!current.crdt) return []
+  const doc = current.crdt.version === 2 ? personalDocumentOf(current) : documentOf(current)
+  try { return versionEntries(doc.getMap<NoteVersionEntry>('history')) }
+  finally { doc.destroy() }
+}
+
+/** Read an immutable projection. Viewing history never edits or replaces the live CRDT. */
+export function readNoteVersion(note: CrdtNote, id: string): { title: string; content: string } {
+  const current = validateCrdtNote(note)
+  if (!current.crdt || !versionId(id)) throw new Error('Invalid note version.')
+  const doc = current.crdt.version === 2 ? sharedDocumentOf(current) : documentOf(current)
+  const personal = current.crdt.version === 2 ? personalDocumentOf(current) : doc
+  try {
+    const entry = personal.getMap<NoteVersionEntry>('history').get(id)
+    if (!entry) throw new Error('This note version does not exist.')
+    return snapshotText(doc, entry.snapshot)
+  } finally { doc.destroy(); if (personal !== doc) personal.destroy() }
+}
+
 /** Convert a trusted UI snapshot spread into operations; never use on remote input. */
 export async function prepareLocalNote(note: CrdtNote): Promise<CrdtNote> {
   if (note.crdt === undefined) return ensureCrdt(note)
@@ -154,6 +206,7 @@ function seed(note: CrdtNote, lineage: string): CrdtNote {
       doc.getMap('meta').set('folder', clean.folder ?? '')
       doc.getMap('meta').set('deleted', clean.deleted === true)
     })
+    addCheckpoint(doc, doc, clean.updatedAt, 'initial')
     return materialize(doc, clean, lineage)
   } finally { doc.destroy() }
 }
@@ -169,12 +222,13 @@ function documentOf(note: CrdtNote): Y.Doc {
 }
 
 function materialize(doc: Y.Doc, note: CrdtNote, lineage: string): CrdtNote {
-  if ([...doc.share.keys()].some(key => !['title', 'content', 'meta'].includes(key))) throw new Error('Unexpected note editing data.')
+  if ([...doc.share.keys()].some(key => !['title', 'content', 'meta', 'history'].includes(key))) throw new Error('Unexpected note editing data.')
   const title = doc.getText('title'), content = doc.getText('content'), meta = doc.getMap('meta')
   if (title.length > MAX_TITLE_LENGTH || content.length > MAX_CONTENT_LENGTH ||
       [...title.toDelta(), ...content.toDelta()].some(operation => typeof operation.insert !== 'string')) throw new Error('Invalid note text in editing history.')
   if ([...meta.keys()].some(key => !['folder', 'deleted'].includes(key)) ||
       typeof meta.get('folder') !== 'string' || typeof meta.get('deleted') !== 'boolean') throw new Error('Invalid note metadata in editing history.')
+  validateVersionHistory(doc, doc)
   const clean = validateFields({ ...note, title: title.toString(), content: content.toString(), folder: meta.get('folder') as string, deleted: meta.get('deleted') as boolean })
   const result: CrdtNote = { ...clean, crdt: { version: 1, update: encode(Y.encodeStateAsUpdate(doc)), lineage } }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_NOTE_BYTES) throw new Error('This note’s editing history is too large to save. Export the Markdown before continuing.')
@@ -281,20 +335,111 @@ function validateSharedDocument(doc: Y.Doc): void {
 }
 
 function validatePersonalDocument(doc: Y.Doc): void {
-  if ([...doc.share.keys()].some(key => key !== 'meta')) throw new Error('Unexpected personal editing data.')
+  if ([...doc.share.keys()].some(key => !['meta', 'history'].includes(key))) throw new Error('Unexpected personal editing data.')
   const meta = doc.getMap('meta')
   if ([...meta.keys()].some(key => !['folder', 'deleted'].includes(key)) ||
       typeof meta.get('folder') !== 'string' || typeof meta.get('deleted') !== 'boolean') throw new Error('Invalid personal note metadata.')
   normalizeFolder(meta.get('folder') as string)
+  validateVersionHistory(doc)
 }
 
 export function materializeSharedNote(doc: Y.Doc, personal: Y.Doc, note: CrdtNote, lineage: string): CrdtNote {
   if (!/^shared:[a-f0-9-]{36}$/.test(lineage)) throw new Error('Invalid shared note lineage.')
   validateSharedDocument(doc)
   validatePersonalDocument(personal)
+  validateVersionHistory(personal, doc)
   const meta = personal.getMap('meta')
   const clean = validateFields({ ...note, title: doc.getText('title').toString(), content: doc.getText('content').toString(), folder: meta.get('folder') as string, deleted: meta.get('deleted') as boolean })
   const result: CrdtNote = { ...clean, crdt: { version: 2, update: encode(Y.encodeStateAsUpdate(doc)), personal: encode(Y.encodeStateAsUpdate(personal)), lineage } }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_NOTE_BYTES) throw new Error('This note’s editing history is too large to save. Export the Markdown before continuing.')
   return result
+}
+
+function versionId(value: unknown): value is string {
+  return typeof value === 'string' && (value === 'initial' || /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value))
+}
+
+function versionEntries(history: Y.Map<NoteVersionEntry>): NoteVersionInfo[] {
+  return Array.from(history.entries(), ([id, entry]) => ({ id, recordedAt: entry.recordedAt, ...(entry.restoredFrom === undefined ? {} : { restoredFrom: entry.restoredFrom }) }))
+    .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt) || (a.id === 'initial' ? -1 : b.id === 'initial' ? 1 : a.id.localeCompare(b.id)))
+}
+
+function addCheckpoint(doc: Y.Doc, personal: Y.Doc, recordedAt: string, id: string, restoredFrom?: string): void {
+  const history = personal.getMap<NoteVersionEntry>('history')
+  if (history.size >= MAX_NOTE_VERSIONS) throw new Error('This note has too many saved versions. Export the Markdown before continuing.')
+  const bytes = Y.encodeSnapshot(Y.snapshot(doc))
+  if (bytes.byteLength > MAX_VERSION_SNAPSHOT_BYTES) throw new Error('This note’s version checkpoint is too large to save. Export the Markdown before continuing.')
+  history.set(id, { recordedAt: new Date(recordedAt).toISOString(), snapshot: encode(bytes), ...(restoredFrom === undefined ? {} : { restoredFrom }) })
+}
+
+interface SnapshotSource { end: number; discardedFrom?: number }
+
+function snapshotSource(doc: Y.Doc): Map<number, SnapshotSource> {
+  const result = new Map<number, SnapshotSource>()
+  for (const [client, structs] of doc.store.clients) {
+    const last = structs.at(-1)
+    if (!last) continue
+    const discarded = structs.find(item => item instanceof Y.GC || (item instanceof Y.Item && item.content instanceof Y.ContentDeleted))
+    result.set(client, { end: last.id.clock + last.length, ...(discarded === undefined ? {} : { discardedFrom: discarded.id.clock }) })
+  }
+  return result
+}
+
+/** Bound every snapshot before Yjs walks it, including references to absent clocks. */
+function validatedSnapshot(value: string, source?: Map<number, SnapshotSource>): Y.Snapshot {
+  if (typeof value !== 'string' || value.length > Math.ceil(MAX_VERSION_SNAPSHOT_BYTES / 3) * 4) throw new Error('Invalid or oversized note version checkpoint.')
+  const bytes = decode(value)
+  if (bytes.byteLength > MAX_VERSION_SNAPSHOT_BYTES) throw new Error('Invalid or oversized note version checkpoint.')
+  let snapshot: Y.Snapshot
+  try { snapshot = Y.decodeSnapshot(bytes) }
+  catch { throw new Error('Invalid note version checkpoint.') }
+  if (encode(Y.encodeSnapshot(snapshot)) !== value) throw new Error('Invalid note version checkpoint encoding.')
+  const validClient = (client: number) => Number.isInteger(client) && client >= 0 && client <= 0xffffffff
+  for (const [client, clock] of snapshot.sv) {
+    const available = source?.get(client)
+    if (!validClient(client) || !Number.isSafeInteger(clock) || clock <= 0 || (source && (!available || clock > available.end))) throw new Error('A note version refers to unavailable editing history.')
+    if (available?.discardedFrom !== undefined && available.discardedFrom < clock) throw new Error('A note version refers to discarded editing history.')
+  }
+  for (const [client, ranges] of snapshot.ds.clients) {
+    let end = -1
+    if (!validClient(client) || !ranges.length) throw new Error('Invalid note version deletion history.')
+    for (const range of ranges) {
+      if (!Number.isSafeInteger(range.clock) || !Number.isSafeInteger(range.len) || range.clock < 0 || range.len <= 0 || range.clock <= end ||
+          range.clock + range.len > (snapshot.sv.get(client) ?? 0)) throw new Error('Invalid note version deletion history.')
+      end = range.clock + range.len - 1
+    }
+  }
+  return snapshot
+}
+
+function validateVersionHistory(personal: Y.Doc, source?: Y.Doc): void {
+  const history = personal.getMap<NoteVersionEntry>('history')
+  if (history.size > MAX_NOTE_VERSIONS) throw new Error('This note has too many saved versions. Export the Markdown before continuing.')
+  const available = source && snapshotSource(source)
+  const validated = new Set<string>()
+  for (const [id, entry] of history.entries()) {
+    if (!versionId(id) || typeof entry !== 'object' || entry === null || Array.isArray(entry) ||
+        Object.keys(entry).some(key => !['recordedAt', 'snapshot', 'restoredFrom'].includes(key)) ||
+        !timestamp(entry.recordedAt) || typeof entry.snapshot !== 'string' ||
+        (entry.restoredFrom !== undefined && (!versionId(entry.restoredFrom) || !history.has(entry.restoredFrom) || entry.restoredFrom === id))) throw new Error('Invalid saved note version.')
+    if (!validated.has(entry.snapshot)) { validatedSnapshot(entry.snapshot, available); validated.add(entry.snapshot) }
+  }
+  // Entries are append-only: a deleted/overwritten entry would silently erase the timeline.
+  for (const structs of personal.store.clients.values()) {
+    for (const item of structs) {
+      if (item instanceof Y.Item && item.parent === history && (item.deleted || item.parentSub === null)) throw new Error('Saved note versions cannot be changed or deleted.')
+    }
+  }
+}
+
+function snapshotText(doc: Y.Doc, encoded: string): { title: string; content: string } {
+  const snapshot = validatedSnapshot(encoded, snapshotSource(doc))
+  const text = (name: 'title' | 'content', limit: number): string => {
+    const delta: Array<{ insert: unknown; attributes?: unknown }> = doc.getText(name).toDelta(snapshot)
+    if (delta.some(operation => typeof operation.insert !== 'string' || operation.attributes !== undefined)) throw new Error('Invalid text in saved note version.')
+    const result = delta.map(operation => operation.insert as string).join('')
+    if (result.length > limit) throw new Error('The saved note version exceeds the text limit.')
+    return result
+  }
+  return { title: text('title', MAX_TITLE_LENGTH), content: text('content', MAX_CONTENT_LENGTH) }
 }

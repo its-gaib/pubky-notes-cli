@@ -4,7 +4,7 @@ import type { Path, Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
 import { normalizeFolder } from './folders.js'
 export { normalizeFolder, folderContains } from './folders.js'
-import { editNote, ensureCrdt, initializeNote, validateCrdtNote } from './crdt.js'
+import { checkpointNote, editNote, ensureCrdt, initializeNote, validateCrdtNote } from './crdt.js'
 import type { CrdtNote } from './crdt.js'
 
 export interface Note extends CrdtNote {}
@@ -80,12 +80,17 @@ export async function updateNote(session: Session, id: string, revision: string,
   return mutate(session, id, revision, async (pair, locks) => {
     const original = canonical(pair)
     if (original.deleted) throw new CliError('NOTE_DELETED', 'Restore this note before editing it.')
-    const updated = validateNote(editNote(await ensureCrdt(original), {
+    const edited = editNote(await ensureCrdt(original), {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.folder !== undefined ? { folder: normalizeFolder(patch.folder) } : {}),
       updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString(),
-    }), id)
+    })
+    // One terminal command is one saved text version. Personal organization
+    // changes preserve the timeline without adding an identical text entry.
+    const updated = validateNote(edited.title !== original.title || edited.content !== original.content
+      ? checkpointNote(edited, { recordedAt: edited.updatedAt })
+      : edited, id)
     await writeVerifiedNote(session, locks, 'private', updated)
     return toView({ private: updated, public: pair.public })
   })

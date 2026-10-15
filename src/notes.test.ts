@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
+import { listNoteVersions, readNoteVersion } from './crdt.js'
 import {
   createNote, deleteNote, folderContains, getNote, listNotes, MAX_CONTENT_LENGTH, MAX_NOTE_BYTES,
   normalizeFolder, publishNote, restoreNote, SAMPLE_MARKDOWN, unpublishNote, updateNote,
@@ -87,6 +88,44 @@ test('explicitly empty Markdown and title stay empty', async () => {
   const created = await createNote(session, { title: '', content: '' })
   assert.equal(created.note.title, '')
   assert.equal(created.note.content, '')
+})
+
+test('terminal saves retain one private text version per command across reloads and publishing', async () => {
+  const { session, files } = makeSession()
+  const created = await createNote(session, { title: 'Original title', content: 'First draft with deleted text' })
+  const initial = listNoteVersions(created.note)
+  assert.equal(initial.length, 1)
+  assert.deepEqual(readNoteVersion(created.note, initial[0].id), {
+    title: 'Original title', content: 'First draft with deleted text',
+  })
+
+  const edited = await updateNote(session, created.note.id, created.revision, {
+    title: 'Revised title', content: 'First draft',
+  })
+  const versions = listNoteVersions(edited.note)
+  assert.equal(versions.length, 2)
+  assert.deepEqual(readNoteVersion(edited.note, versions[0].id), {
+    title: 'Original title', content: 'First draft with deleted text',
+  })
+  assert.deepEqual(readNoteVersion(edited.note, versions[1].id), {
+    title: 'Revised title', content: 'First draft',
+  })
+
+  const moved = await updateNote(session, created.note.id, edited.revision, { folder: 'Work/Notes' })
+  const unchanged = await updateNote(session, created.note.id, moved.revision, { content: moved.note.content })
+  assert.deepEqual(listNoteVersions(unchanged.note), versions)
+  const reloaded = await getNote(session, created.note.id)
+  assert.deepEqual(listNoteVersions(reloaded.note), versions)
+  assert.deepEqual(readNoteVersion(reloaded.note, initial[0].id), {
+    title: 'Original title', content: 'First draft with deleted text',
+  })
+
+  const published = await publishNote(session, created.note.id, reloaded.revision)
+  assert.deepEqual(listNoteVersions(published.note), versions)
+  assert.deepEqual(files.get(publicPath(created.note.id)), {
+    id: created.note.id, title: 'Revised title', content: 'First draft',
+    createdAt: created.note.createdAt, updatedAt: unchanged.note.updatedAt,
+  })
 })
 
 test('create checks collisions under both locks without overwriting', async () => {
