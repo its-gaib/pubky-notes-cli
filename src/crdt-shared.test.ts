@@ -51,6 +51,6 @@ test('shared note checkpoints stay private and leave peer-visible updates unchan
   const peer = new Y.Doc({ gc: false })
   try {
     Y.applyUpdate(peer, decode(saved.crdt!.update))
-    assert.deepEqual([...peer.share.keys()].sort(), ['content', 'title'])
+    assert.deepEqual([...peer.share.keys()].sort(), ['content', 'edits', 'title'])
   } finally { peer.destroy() }
 })

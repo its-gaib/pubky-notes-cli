@@ -7,6 +7,18 @@ export const MAX_CONTENT_LENGTH = 250_000
 export const MAX_TITLE_LENGTH = 200
 export const MAX_NOTE_VERSIONS = 5_000
 export const MAX_VERSION_SNAPSHOT_BYTES = 128 * 1024
+export const MAX_NOTE_EDITS = 20_000
+export const MAX_VERSION_CHANGE_TEXT_LENGTH = 1024 * 1024
+const MAX_EDIT_RANGES = 2_048
+
+/** Editor-supplied attribution, not an independently authenticated identity. */
+export interface NoteEditor { id: string; label: string }
+interface EditRange { field: 'title' | 'content'; client: number; clock: number; length: number }
+interface NoteEditEntry { recordedAt: string; author?: NoteEditor; inserted: EditRange[]; deleted: EditRange[] }
+export interface NoteVersionChanges {
+  baseline: boolean
+  edits: Array<{ id: string; recordedAt: string; author?: NoteEditor; changes: Array<{ field: 'title' | 'content'; inserted: string; deleted: string }> }>
+}
 
 export interface NoteVersionInfo { id: string; recordedAt: string; restoredFrom?: string }
 interface NoteVersionEntry { recordedAt: string; snapshot: string; restoredFrom?: string }
@@ -46,23 +58,22 @@ export async function ensureCrdt(note: CrdtNote): Promise<CrdtNote> {
   return seed(clean, `legacy:${hex}`)
 }
 
-export function editNote(note: CrdtNote, patch: NotePatch): CrdtNote {
+export function editNote(note: CrdtNote, patch: NotePatch, editor?: NoteEditor): CrdtNote {
   const current = validateCrdtNote(note)
   if (!current.crdt) throw new Error('Initialize this note before editing it.')
   const requested = validateFields({ ...current, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() })
   if (current.crdt.version === 2) {
     const doc = sharedDocumentOf(current), personal = personalDocumentOf(current)
     try {
-      doc.transact(() => { editText(doc.getText('title'), requested.title); editText(doc.getText('content'), requested.content) })
+      editAttributedText(doc, requested, editor)
       editPersonal(personal, current, requested)
       return materializeSharedNote(doc, personal, requested, current.crdt.lineage)
     } finally { doc.destroy(); personal.destroy() }
   }
   const doc = documentOf(current)
   try {
+    editAttributedText(doc, requested, editor)
     doc.transact(() => {
-      editText(doc.getText('title'), requested.title)
-      editText(doc.getText('content'), requested.content)
       const meta = doc.getMap('meta')
       if ((current.folder ?? '') !== (requested.folder ?? '')) meta.set('folder', requested.folder ?? '')
       if ((current.deleted === true) !== (requested.deleted === true)) meta.set('deleted', requested.deleted === true)
@@ -174,6 +185,48 @@ export function readNoteVersion(note: CrdtNote, id: string): { title: string; co
   } finally { doc.destroy(); if (personal !== doc) personal.destroy() }
 }
 
+/** Actual edits first observed in this checkpoint, including concurrent contributors. */
+export function readNoteVersionChanges(note: CrdtNote, id: string): NoteVersionChanges {
+  const current = validateCrdtNote(note)
+  if (!current.crdt || !versionId(id)) throw new Error('Invalid note version.')
+  const doc = current.crdt.version === 2 ? sharedDocumentOf(current) : documentOf(current)
+  const personal = current.crdt.version === 2 ? personalDocumentOf(current) : doc
+  try {
+    const history = personal.getMap<NoteVersionEntry>('history')
+    const versions = versionEntries(history), index = versions.findIndex(version => version.id === id)
+    if (index < 0) throw new Error('This note version does not exist.')
+    if (index === 0) return { baseline: true, edits: [] }
+    const selected = validatedSnapshot(history.get(id)!.snapshot)
+    // Earlier checkpoints can be concurrent branches. Their union prevents an
+    // edit from being attributed twice when a later checkpoint reunites them.
+    const seen = new Map<number, number>()
+    for (const previous of versions.slice(0, index)) {
+      for (const [client, clock] of validatedSnapshot(history.get(previous.id)!.snapshot).sv) seen.set(client, Math.max(clock, seen.get(client) ?? 0))
+    }
+    const journal = doc.getMap<NoteEditEntry>('edits')
+    const edits: NoteVersionChanges['edits'] = []
+    const included: Array<[string, NoteEditEntry]> = []
+    let outputLength = 0
+    for (const [editId, entry] of journal.entries()) {
+      const item = journal._map.get(editId)!
+      if (item.id.clock >= (selected.sv.get(item.id.client) ?? 0) || item.id.clock < (seen.get(item.id.client) ?? 0)) continue
+      outputLength += [...entry.inserted, ...entry.deleted].reduce((sum, range) => sum + range.length, 0)
+      if (outputLength > MAX_VERSION_CHANGE_TEXT_LENGTH) throw new Error('This version has too many changes to display at once.')
+      included.push([editId, entry])
+    }
+    for (const [editId, entry] of included) {
+      const changes = (['title', 'content'] as const).map(field => ({
+        field,
+        inserted: entry.inserted.filter(range => range.field === field).map(range => rangeText(doc, range)).join(''),
+        deleted: entry.deleted.filter(range => range.field === field).map(range => rangeText(doc, range)).join(''),
+      })).filter(change => change.inserted.length > 0 || change.deleted.length > 0)
+      edits.push({ id: editId, recordedAt: entry.recordedAt, ...(entry.author ? { author: { ...entry.author } } : {}), changes })
+    }
+    edits.sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt) || a.id.localeCompare(b.id))
+    return { baseline: false, edits }
+  } finally { doc.destroy(); if (personal !== doc) personal.destroy() }
+}
+
 /** Convert a trusted UI snapshot spread into operations; never use on remote input. */
 export async function prepareLocalNote(note: CrdtNote): Promise<CrdtNote> {
   if (note.crdt === undefined) return ensureCrdt(note)
@@ -222,13 +275,14 @@ function documentOf(note: CrdtNote): Y.Doc {
 }
 
 function materialize(doc: Y.Doc, note: CrdtNote, lineage: string): CrdtNote {
-  if ([...doc.share.keys()].some(key => !['title', 'content', 'meta', 'history'].includes(key))) throw new Error('Unexpected note editing data.')
+  if ([...doc.share.keys()].some(key => !['title', 'content', 'meta', 'history', 'edits'].includes(key))) throw new Error('Unexpected note editing data.')
   const title = doc.getText('title'), content = doc.getText('content'), meta = doc.getMap('meta')
   if (title.length > MAX_TITLE_LENGTH || content.length > MAX_CONTENT_LENGTH ||
       [...title.toDelta(), ...content.toDelta()].some(operation => typeof operation.insert !== 'string')) throw new Error('Invalid note text in editing history.')
   if ([...meta.keys()].some(key => !['folder', 'deleted'].includes(key)) ||
       typeof meta.get('folder') !== 'string' || typeof meta.get('deleted') !== 'boolean') throw new Error('Invalid note metadata in editing history.')
   validateVersionHistory(doc, doc)
+  validateEditHistory(doc)
   const clean = validateFields({ ...note, title: title.toString(), content: content.toString(), folder: meta.get('folder') as string, deleted: meta.get('deleted') as boolean })
   const result: CrdtNote = { ...clean, crdt: { version: 1, update: encode(Y.encodeStateAsUpdate(doc)), lineage } }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_NOTE_BYTES) throw new Error('This note’s editing history is too large to save. Export the Markdown before continuing.')
@@ -241,6 +295,137 @@ export function editText(text: Y.Text, value: string): void {
     if (operation === -1) text.delete(index, chunk.length)
     else if (operation === 1) { text.insert(index, chunk); index += chunk.length }
     else index += chunk.length
+  }
+}
+
+/** Record authorship with the text operation, including who removed old text. */
+export function editAttributedText(doc: Y.Doc, requested: Pick<CrdtNote, 'title' | 'content' | 'updatedAt'>, editor?: NoteEditor): void {
+  const author = editor === undefined ? undefined : normalizeNoteEditor(editor)
+  if (doc.getText('title').toString() === requested.title && doc.getText('content').toString() === requested.content) return
+  const journal = doc.getMap<NoteEditEntry>('edits')
+  if (journal.size >= MAX_NOTE_EDITS) throw new Error('This note has too many recorded edits. Export the Markdown before continuing.')
+  const inserted: EditRange[] = [], deleted: EditRange[] = []
+  const append = (ranges: EditRange[], range: EditRange) => {
+    const previous = ranges.at(-1)
+    if (previous && previous.field === range.field && previous.client === range.client && previous.clock + previous.length === range.clock) previous.length += range.length
+    else ranges.push(range)
+    if (inserted.length + deleted.length > MAX_EDIT_RANGES) throw new Error('This edit has too many text changes. Make a smaller edit before continuing.')
+  }
+  doc.transact(() => {
+    for (const field of ['title', 'content'] as const) {
+      const text = doc.getText(field)
+      let index = 0
+      for (const [operation, chunk] of diff(text.toString(), requested[field])) {
+        if (operation === -1) {
+          let position = 0, remaining = chunk.length
+          for (let item = text._start; item && remaining > 0; item = item.right) {
+            if (item.deleted || !item.countable) continue
+            const offset = Math.max(0, index - position)
+            if (offset < item.length) {
+              const length = Math.min(item.length - offset, remaining)
+              append(deleted, { field, client: item.id.client, clock: item.id.clock + offset, length })
+              remaining -= length
+            }
+            position += item.length
+          }
+          if (remaining !== 0) throw new Error('Invalid edit deletion range.')
+          text.delete(index, chunk.length)
+        } else if (operation === 1) {
+          const previous = doc.store.clients.get(doc.clientID)?.at(-1)
+          const clock = previous ? previous.id.clock + previous.length : 0
+          text.insert(index, chunk)
+          append(inserted, { field, client: doc.clientID, clock, length: chunk.length })
+          index += chunk.length
+        } else index += chunk.length
+      }
+    }
+    journal.set(crypto.randomUUID(), { recordedAt: requested.updatedAt, ...(author ? { author } : {}), inserted, deleted })
+  })
+}
+
+const EDITOR_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
+const editorLabel = (label: string): string => Array.from(label.replace(EDITOR_CONTROLS, '').trim()).slice(0, 64).join('') || 'Editor'
+
+/** Normalize display names on local writes; remote records must already be canonical. */
+export function normalizeNoteEditor(editor: NoteEditor): NoteEditor {
+  return validatedEditor({ id: editor?.id, label: typeof editor?.label === 'string' ? editorLabel(editor.label) : editor?.label })
+}
+
+function validatedEditor(value: unknown): NoteEditor {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'id,label' ||
+      !('id' in value) || typeof value.id !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(value.id) ||
+      !('label' in value) || typeof value.label !== 'string' || value.label.length > 128 || editorLabel(value.label) !== value.label) throw new Error('Invalid editor attribution.')
+  return { id: value.id, label: value.label }
+}
+
+function validateEditEntry(value: unknown): asserts value is NoteEditEntry {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => !['recordedAt', 'author', 'inserted', 'deleted'].includes(key)) ||
+      !('recordedAt' in value) || !timestamp(value.recordedAt) || !('inserted' in value) || !Array.isArray(value.inserted) ||
+      !('deleted' in value) || !Array.isArray(value.deleted) || value.inserted.length + value.deleted.length === 0 ||
+      value.inserted.length + value.deleted.length > MAX_EDIT_RANGES) throw new Error('Invalid recorded note edit.')
+  if ('author' in value) validatedEditor(value.author)
+  for (const range of [...value.inserted, ...value.deleted]) {
+    if (typeof range !== 'object' || range === null || Array.isArray(range) || Object.keys(range).sort().join(',') !== 'client,clock,field,length' ||
+        !['title', 'content'].includes(range.field) || !Number.isInteger(range.client) || range.client < 0 || range.client > 0xffffffff ||
+        !Number.isSafeInteger(range.clock) || range.clock < 0 || !Number.isSafeInteger(range.length) || range.length <= 0 ||
+        range.length > (range.field === 'title' ? MAX_TITLE_LENGTH : MAX_CONTENT_LENGTH) || !Number.isSafeInteger(range.clock + range.length)) throw new Error('Invalid recorded edit range.')
+  }
+  for (const ranges of [value.inserted, value.deleted]) {
+    for (const field of ['title', 'content'] as const) {
+      if (ranges.filter(range => range.field === field).reduce((sum, range) => sum + range.length, 0) > (field === 'title' ? MAX_TITLE_LENGTH : MAX_CONTENT_LENGTH)) throw new Error('Recorded edit text exceeds the field limit.')
+    }
+    const sorted = [...ranges].sort((a, b) => a.client - b.client || a.clock - b.clock)
+    for (let index = 1; index < sorted.length; index++) {
+      if (sorted[index]!.client === sorted[index - 1]!.client && sorted[index]!.clock < sorted[index - 1]!.clock + sorted[index - 1]!.length) throw new Error('Recorded edit ranges overlap.')
+    }
+  }
+}
+
+/** Resolve IDs directly so adjacent deletions by different editors stay separate. */
+function rangeText(doc: Y.Doc, range: EditRange, requireDeleted = false, read = true): string {
+  const text = doc.getText(range.field)
+  const structs = doc.store.clients.get(range.client)
+  if (!structs?.length) throw new Error('A recorded edit refers to unavailable text.')
+  let low = 0, high = structs.length - 1
+  while (low < high) {
+    const middle = Math.floor((low + high + 1) / 2)
+    if (structs[middle]!.id.clock <= range.clock) low = middle
+    else high = middle - 1
+  }
+  let cursor = range.clock, result = ''
+  const end = cursor + range.length
+  for (let index = low; cursor < end; index++) {
+    const item = structs[index]
+    if (!(item instanceof Y.Item) || !(item.content instanceof Y.ContentString) || item.parent !== text ||
+        item.id.clock > cursor || item.id.clock + item.length <= cursor || (requireDeleted && !item.deleted)) throw new Error('A recorded edit refers to unavailable text.')
+    const length = Math.min(end, item.id.clock + item.length) - cursor
+    if (read) result += item.content.str.slice(cursor - item.id.clock, cursor - item.id.clock + length)
+    cursor += length
+  }
+  return result
+}
+
+function validateEditHistory(doc: Y.Doc): void {
+  const journal = doc.getMap<NoteEditEntry>('edits')
+  if (journal.size > MAX_NOTE_EDITS) throw new Error('This note has too many recorded edits. Export the Markdown before continuing.')
+  let referencedText = 0
+  for (const [id, entry] of journal.entries()) {
+    if (!versionId(id) || id === 'initial') throw new Error('Invalid recorded edit ID.')
+    validateEditEntry(entry)
+    const item = journal._map.get(id)!
+    for (const range of entry.inserted) {
+      if (range.client !== item.id.client || range.clock + range.length > item.id.clock) throw new Error('Invalid recorded insertion ownership.')
+    }
+    referencedText += [...entry.inserted, ...entry.deleted].reduce((sum, range) => sum + range.length, 0)
+    if (referencedText > MAX_NOTE_BYTES) throw new Error('This note’s edit attribution is too large to save. Export the Markdown before continuing.')
+    for (const range of entry.inserted) rangeText(doc, range, false, false)
+    for (const range of entry.deleted) rangeText(doc, range, true, false)
+  }
+  for (const structs of doc.store.clients.values()) {
+    for (const item of structs) {
+      if (item instanceof Y.Item && item.parent === journal && (item.deleted || item.parentSub === null || !(item.content instanceof Y.ContentAny))) throw new Error('Recorded edits cannot be changed or deleted.')
+    }
   }
 }
 
@@ -277,7 +462,7 @@ export function decode(value: string): Uint8Array {
   return bytes
 }
 
-/** Version two keeps the only peer-visible state in a plain-text Y.Doc. */
+/** Version two shares text and reported edit attribution; checkpoints remain private. */
 export function sharedDocumentOf(note: CrdtNote): Y.Doc {
   if (note.crdt?.version !== 2) throw new Error('This note is not a shared document.')
   const update = decode(note.crdt.update)
@@ -319,19 +504,27 @@ export function validateSharedUpdate(update: Uint8Array): void {
   if (decoded.structs.length > 100_000) throw new Error('Shared editing history has too many operations.')
   for (const item of decoded.structs) {
     if (item instanceof Y.Skip) continue
-    if (!(item instanceof Y.Item) || !(item.content instanceof Y.ContentString) || item.parentSub !== null ||
-        (item.parent !== null && !(typeof item.parent === 'string' && ['title', 'content'].includes(item.parent)))) {
-      throw new Error('Shared updates may contain only plain title and content text.')
+    if (!(item instanceof Y.Item)) throw new Error('Invalid shared editing operation.')
+    if (item.content instanceof Y.ContentString && item.parentSub === null &&
+        (item.parent === null || (typeof item.parent === 'string' && ['title', 'content'].includes(item.parent)))) continue
+    if (item.content instanceof Y.ContentAny && typeof item.parentSub === 'string' && versionId(item.parentSub) && item.parentSub !== 'initial' &&
+        (item.parent === null || (typeof item.parent === 'string' && item.parent === 'edits'))) {
+      const entries = item.content.getContent()
+      if (entries.length !== 1) throw new Error('Invalid shared attribution operation.')
+      validateEditEntry(entries[0])
+      continue
     }
+    throw new Error('Shared updates may contain only plain text and edit attribution.')
   }
 }
 
 function validateSharedDocument(doc: Y.Doc): void {
-  if ([...doc.share.keys()].some(key => !['title', 'content'].includes(key))) throw new Error('Unexpected shared editing data.')
+  if ([...doc.share.keys()].some(key => !['title', 'content', 'edits'].includes(key))) throw new Error('Unexpected shared editing data.')
   const title = doc.getText('title'), content = doc.getText('content')
   if (title.length > MAX_TITLE_LENGTH || content.length > MAX_CONTENT_LENGTH ||
       [...title.toDelta(), ...content.toDelta()].some(operation => typeof operation.insert !== 'string' || operation.attributes !== undefined)) throw new Error('Invalid shared note text.')
   validateSharedUpdate(Y.encodeStateAsUpdate(doc))
+  validateEditHistory(doc)
 }
 
 function validatePersonalDocument(doc: Y.Doc): void {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
-import { listNoteVersions, readNoteVersion } from './crdt.js'
+import { listNoteVersions, readNoteVersion, readNoteVersionChanges } from './crdt.js'
 import {
   createNote, deleteNote, folderContains, getNote, listNotes, MAX_CONTENT_LENGTH, MAX_NOTE_BYTES,
   normalizeFolder, publishNote, restoreNote, SAMPLE_MARKDOWN, unpublishNote, updateNote,
@@ -104,6 +104,11 @@ test('terminal saves retain one private text version per command across reloads 
   })
   const versions = listNoteVersions(edited.note)
   assert.equal(versions.length, 2)
+  const changes = readNoteVersionChanges(edited.note, versions[1].id)
+  assert.equal(changes.edits.length, 1)
+  assert.equal(changes.edits[0].author?.id, `pubky:${OWNER}`)
+  assert.equal(changes.edits[0].author?.label, `Editor ${OWNER.slice(-12)} (CLI)`)
+  assert.ok(changes.edits[0].changes.some(change => change.deleted.includes('deleted text')))
   assert.deepEqual(readNoteVersion(edited.note, versions[0].id), {
     title: 'Original title', content: 'First draft with deleted text',
   })

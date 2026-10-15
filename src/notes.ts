@@ -80,12 +80,13 @@ export async function updateNote(session: Session, id: string, revision: string,
   return mutate(session, id, revision, async (pair, locks) => {
     const original = canonical(pair)
     if (original.deleted) throw new CliError('NOTE_DELETED', 'Restore this note before editing it.')
+    const editorId = session.info.publicKey.z32()
     const edited = editNote(await ensureCrdt(original), {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.folder !== undefined ? { folder: normalizeFolder(patch.folder) } : {}),
       updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString(),
-    })
+    }, { id: `pubky:${editorId}`, label: `Editor ${editorId.slice(-12)} (CLI)` })
     // One terminal command is one saved text version. Personal organization
     // changes preserve the timeline without adding an identical text entry.
     const updated = validateNote(edited.title !== original.title || edited.content !== original.content
