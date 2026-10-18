@@ -4,8 +4,8 @@ import type { Path, Session, StorageLock } from '@synonymdev/pubky'
 import { CliError } from './errors.js'
 import { normalizeFolder } from './folders.js'
 export { normalizeFolder, folderContains } from './folders.js'
-import { checkpointNote, editNote, ensureCrdt, initializeNote, validateCrdtNote } from './crdt.js'
-import type { CrdtNote } from './crdt.js'
+import { checkpointNote, editNote, ensureCrdt, initializeNote, listNoteVersions, readNoteVersion, readNoteVersionChanges, validateCrdtNote } from './crdt.js'
+import type { CrdtNote, NoteVersionInfo } from './crdt.js'
 
 export interface Note extends CrdtNote {}
 
@@ -39,7 +39,7 @@ type Space = keyof typeof ROOTS
 type Pair = { private: Note | null; public: Note | null }
 type Locks = Record<Space, StorageLock>
 
-export async function listNotes(session: Session, options: { trash?: boolean } = {}): Promise<NoteView[]> {
+export async function listNotes(session: Session, options: { trash?: boolean; all?: boolean } = {}): Promise<NoteView[]> {
   const [privateIds, publicIds] = await Promise.all([
     listIds(session, 'private'), listIds(session, 'public'),
   ])
@@ -54,12 +54,54 @@ export async function listNotes(session: Session, options: { trash?: boolean } =
       results[position] = pair.private || pair.public ? toView(pair) : null
     }
   }))
-  return results.filter((note): note is NoteView => note !== null && !!note.note.deleted === !!options.trash)
+  return results.filter((note): note is NoteView => note !== null && (options.all === true || !!note.note.deleted === !!options.trash))
     .sort((a, b) => b.note.updatedAt.localeCompare(a.note.updatedAt) || a.note.id.localeCompare(b.note.id))
 }
 
 export async function getNote(session: Session, id: string): Promise<NoteView> {
   return toView(await readPair(session, id))
+}
+
+export async function getNoteHistory(session: Session, id: string) {
+  const view = await getNote(session, id)
+  return { id, revision: view.revision, versions: listNoteVersions(view.note) }
+}
+
+export async function getNoteVersion(session: Session, id: string, version: string, changes = false) {
+  const view = await getNote(session, id)
+  const metadata = requireVersion(view.note, version)
+  return {
+    id, version: metadata, ...readNoteVersion(view.note, version), revision: view.revision,
+    ...(changes ? { changes: readNoteVersionChanges(view.note, version) } : {}),
+  }
+}
+
+export async function restoreNoteVersion(session: Session, id: string, version: string, revision: string): Promise<NoteView> {
+  return mutate(session, id, revision, async (pair, locks) => {
+    const original = canonical(pair)
+    if (original.deleted) throw new CliError('NOTE_DELETED', 'Restore this note from Trash before restoring a version.')
+    requireVersion(original, version)
+    const text = readNoteVersion(original, version)
+    if (text.title === original.title && text.content === original.content) return toView(pair)
+    // Preserve any text not yet checkpointed before applying the selected version.
+    const current = checkpointNote(await ensureCrdt(original))
+    const editorId = session.info.publicKey.z32()
+    const edited = editNote(current, {
+      ...text, updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString(),
+    }, { id: `pubky:${editorId}`, label: `Editor ${editorId.slice(-12)} (CLI)` })
+    const restored = validateNote(checkpointNote(edited, { recordedAt: edited.updatedAt, restoredFrom: version }), id)
+    await writeVerifiedNote(session, locks, 'private', restored)
+    return toView({ private: restored, public: pair.public })
+  })
+}
+
+function requireVersion(note: Note, version: string): NoteVersionInfo {
+  if (typeof version !== 'string' || (version !== 'initial' && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(version))) {
+    throw new CliError('INVALID_VERSION', 'Use a version ID returned by history.')
+  }
+  const metadata = listNoteVersions(note).find(entry => entry.id === version)
+  if (!metadata) throw new CliError('VERSION_NOT_FOUND', 'This note version does not exist. Read its history again.')
+  return metadata
 }
 
 export async function createNote(session: Session, input: NotePatch = {}): Promise<NoteView> {
@@ -94,6 +136,19 @@ export async function updateNote(session: Session, id: string, revision: string,
       : edited, id)
     await writeVerifiedNote(session, locks, 'private', updated)
     return toView({ private: updated, public: pair.public })
+  })
+}
+
+export async function moveNoteFolder(session: Session, id: string, revision: string, folder: string): Promise<NoteView> {
+  return mutate(session, id, revision, async (pair, locks) => {
+    const original = canonical(pair)
+    const normalized = normalizeFolder(folder)
+    if ((original.folder ?? '') === normalized) return toView(pair)
+    const moved = validateNote(editNote(await ensureCrdt(original), {
+      folder: normalized, updatedAt: new Date(Math.max(Date.now(), Date.parse(original.updatedAt) + 1)).toISOString(),
+    }), id)
+    await writeVerifiedNote(session, locks, 'private', moved)
+    return toView({ private: moved, public: pair.public })
   })
 }
 
@@ -293,7 +348,7 @@ async function listIds(session: Session, space: Space): Promise<string[]> {
   return [...ids]
 }
 
-async function readBoundedJson(response: Response): Promise<unknown> {
+export async function readBoundedJson(response: Response): Promise<unknown> {
   if (!response.ok) throw { data: { statusCode: response.status } }
   const declared = response.headers.get('content-length')
   if (declared && Number(declared) > MAX_NOTE_BYTES) {
@@ -321,7 +376,7 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   try { return JSON.parse(text) } catch { throw new CliError('INVALID_NOTE', 'The homeserver returned an invalid note file.') }
 }
 
-function validateNote(value: unknown, expectedId?: string): Note {
+export function validateNote(value: unknown, expectedId?: string): Note {
   if (typeof value !== 'object' || value === null) throw new CliError('INVALID_NOTE', 'Invalid note data.')
   const record = value as Record<string, unknown>
   requireId(record.id)
